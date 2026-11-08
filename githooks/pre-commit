@@ -1,0 +1,26 @@
+#!/bin/sh
+# Runs before every commit: the tests, the manifest check, and a scan for bidi
+# control characters. Enable with: git config core.hooksPath githooks
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+python3 -I -B -m unittest discover -s tests -q 2>/dev/null || {
+  echo "pre-commit: tests failed; run: python3 -I -B -m unittest discover -s tests" >&2
+  exit 1
+}
+
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate "$ROOT" >/dev/null || { echo "pre-commit: manifest.json is invalid" >&2; exit 1; }
+else
+  python3 -I -m json.tool manifest.json >/dev/null || { echo "pre-commit: manifest.json is not valid JSON" >&2; exit 1; }
+fi
+
+# U+202A–U+202E and U+2066–U+2069 can make code read differently from how it runs.
+if git ls-files -z | xargs -0 grep -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' 2>/dev/null; then
+  echo "pre-commit: the files above contain bidi control characters" >&2
+  exit 1
+fi
+
+echo "pre-commit: tests, manifest and bidi scan passed"
