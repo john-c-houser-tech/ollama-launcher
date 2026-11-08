@@ -361,6 +361,118 @@ class Launch(TempCache):
     self.assertIn("Couldn't open a terminal", result["error"])
 
 
+class Folders(TempCache):
+  def make(self, root, name, age_days, git=False):
+    path = root / name
+    path.mkdir()
+    stamp = time.time() - age_days * 86400
+    if git:
+      (path / ".git").mkdir()
+      (path / ".git" / "index").write_text("")
+      os.utime(path / ".git" / "index", (time.time(), time.time()))  # worked on just now
+    os.utime(path, (stamp, stamp))
+    return path
+
+  def test_base_first_then_most_recent_work(self):
+    root = Path(self.tmp.name) / "Projects"
+    root.mkdir()
+    self.make(root, "old", 30)
+    self.make(root, "newer", 2)
+    self.make(root, "repo-touched-today", 60, git=True)
+    self.make(root, ".hidden", 0)
+    (root / "a-file.txt").write_text("not a folder")
+    result = ol.list_folders(str(root))
+    self.assertTrue(result["ok"])
+    self.assertEqual([f["name"] for f in result["folders"][1:]], ["repo-touched-today", "newer", "old"])
+    base = result["folders"][0]
+    self.assertTrue(base["base"])
+    self.assertEqual(base["path"], str(root.resolve()))
+
+  def test_home_is_shown_as_tilde(self):
+    home = Path(self.tmp.name)
+    (home / "Projects").mkdir()
+    with mock.patch.dict(os.environ, {"HOME": str(home)}):
+      result = ol.list_folders("~/Projects")
+    self.assertEqual(result["folders"][0]["name"], "~/Projects")
+
+  def test_missing_base(self):
+    result = ol.list_folders("/nonexistent/Projects")
+    self.assertFalse(result["ok"])
+    self.assertIn("Folder not found", result["error"])
+
+  def test_names_are_plain_and_capped(self):
+    root = Path(self.tmp.name) / "P"
+    root.mkdir()
+    (root / ("x" + BIDI_OVERRIDE + "y" * 100)).mkdir()
+    name = ol.list_folders(str(root))["folders"][1]["name"]
+    self.assertNotIn(BIDI_OVERRIDE, name)
+    self.assertLessEqual(len(name), 80)
+
+  def test_launch_uses_the_folder_and_saves_nothing(self):
+    # Forgetting the pick between openings is the panel's job (open() resets
+    # it); the helper's part is to keep no record of launch folders at all.
+    folder = Path(self.tmp.name) / "work"
+    folder.mkdir()
+    before = sorted(ol.CACHE_DIR.rglob("*")) if ol.CACHE_DIR.exists() else []
+    with mock.patch.object(ol, "fetch_json", return_value={"models": [{"name": "m:1"}]}), \
+         mock.patch.object(ol.subprocess, "Popen") as popen:
+      self.assertTrue(ol.launch("m:1", str(folder))["ok"])
+    self.assertIn(f"cd -- '{folder}'", popen.call_args.args[0][-1])
+    after = sorted(ol.CACHE_DIR.rglob("*")) if ol.CACHE_DIR.exists() else []
+    self.assertEqual(before, after)
+
+  def test_names_are_shown_as_they_are(self):
+    root = Path(self.tmp.name) / "P"
+    root.mkdir()
+    for name in ("a&amp;b", " lead", "sp  ace"):
+      (root / name).mkdir()
+    names = {f["name"] for f in ol.list_folders(str(root))["folders"][1:]}
+    self.assertEqual(names, {"a&amp;b", " lead", "sp  ace"})
+
+  @unittest.skipIf(os.geteuid() == 0, "root can enter any folder")
+  def test_folders_you_cannot_enter_are_left_out(self):
+    root = Path(self.tmp.name) / "P"
+    root.mkdir()
+    (root / "open").mkdir()
+    locked = root / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    self.addCleanup(locked.chmod, 0o755)
+    self.assertEqual([f["name"] for f in ol.list_folders(str(root))["folders"][1:]], ["open"])
+    with mock.patch.object(ol, "fetch_json", return_value={"models": [{"name": "m:1"}]}), \
+         mock.patch.object(ol.subprocess, "Popen") as popen:
+      self.assertIn("Can't open", ol.launch("m:1", str(locked))["error"])
+    popen.assert_not_called()
+
+  def test_cap_reports_how_many_more(self):
+    root = Path(self.tmp.name) / "P"
+    root.mkdir()
+    for i in range(ol.MAX_FOLDERS + 5):
+      (root / f"d{i:03}").mkdir()
+    result = ol.list_folders(str(root))
+    self.assertEqual(len(result["folders"]), ol.MAX_FOLDERS + 1)  # plus the base
+    self.assertEqual(result["more"], 5)
+
+  def test_symlinked_folder_listed_and_broken_link_skipped(self):
+    root = Path(self.tmp.name) / "P"
+    root.mkdir()
+    target = Path(self.tmp.name) / "elsewhere"
+    target.mkdir()
+    (root / "linked").symlink_to(target)
+    (root / "broken").symlink_to(Path(self.tmp.name) / "missing")
+    folders = ol.list_folders(str(root))["folders"][1:]
+    self.assertEqual([(f["name"], f["path"]) for f in folders], [("linked", str(root / "linked"))])
+
+  def test_command_line(self):
+    root = Path(self.tmp.name) / "P"
+    (root / "one").mkdir(parents=True)
+    out = io.StringIO()
+    with redirect_stdout(out):
+      code = ol.main(["x", "folders", str(root)])
+    self.assertEqual(code, 0)
+    self.assertEqual([f["name"] for f in json.loads(out.getvalue())["folders"]][1:], ["one"])
+
+
 class Main(unittest.TestCase):
   def test_unexpected_error_still_prints_json(self):
     out = io.StringIO()

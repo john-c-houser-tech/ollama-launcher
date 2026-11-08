@@ -8,6 +8,9 @@ Commands (each prints one JSON object on stdout):
   descriptions  Fetch missing or week-old descriptions from ollama.com, within
                 a fixed time budget, caching each one as it arrives.
   credit        Ollama Cloud credit left, from ollama.com/api/balance.
+  folders <base>
+                The base folder and its subfolders, most recently worked in
+                first. The panel starts at the base every time it opens.
   launch <model> <directory>
                 Open a terminal running opencode on that local model.
 
@@ -512,6 +515,76 @@ def credit(force: bool = False) -> dict:
     return credit_view(cache)
 
 
+# ---------- folders ----------
+
+MAX_FOLDERS = 40
+
+
+def resolve_folder(directory: str) -> Path:
+  folder = Path(os.path.expanduser(directory or "~/Projects"))
+  if not folder.is_absolute():
+    folder = Path.home() / folder
+  return folder.resolve()
+
+
+def display_path(path: Path) -> str:
+  home = str(Path.home())
+  text = str(path)
+  return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+
+def recent_work(entry: os.DirEntry) -> float:
+  """When a folder was last worked in: its own modification time (which moves
+  when its top-level entries change), or for a git repo the index, which
+  moves on every stage and checkout. A worktree or submodule, whose .git is a
+  file, falls back to the folder's own time."""
+  newest = entry.stat().st_mtime
+  try:
+    newest = max(newest, os.stat(os.path.join(entry.path, ".git", "index")).st_mtime)
+  except OSError:
+    pass
+  return newest
+
+
+def folder_name(name: str, limit: int = 80) -> str:
+  """A folder name as it really is, minus characters that could hide or
+  reorder text (controls, bidi formatting, line breaks). No unescaping and
+  no space collapsing, so two different folders don't look the same."""
+  text = "".join(ch for ch in name if unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+  return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def can_enter(path) -> bool:
+  return os.access(path, os.R_OK | os.X_OK)
+
+
+def list_folders(base: str) -> dict:
+  root = resolve_folder(base)
+  shown_root = folder_name(display_path(root), 200)
+  if not root.is_dir():
+    return {"ok": False, "error": f"Folder not found: {shown_root}", "folders": [], "more": 0}
+  found = []
+  try:
+    with os.scandir(root) as entries:
+      for entry in entries:
+        if entry.name.startswith("."):
+          continue
+        try:
+          entry.name.encode("utf-8")  # a name that can't round-trip through the panel
+          # Listed only if opencode could start there.
+          if entry.is_dir() and can_enter(entry.path):
+            found.append((recent_work(entry), entry.name))
+        except (OSError, UnicodeEncodeError):
+          continue
+  except OSError as error:
+    return {"ok": False, "error": f"Can't read {shown_root}: {error.strerror}", "folders": [], "more": 0}
+  found.sort(key=lambda item: (-item[0], item[1].lower()))
+  folders = [{"path": str(root), "name": shown_root, "base": True}]
+  for _, name in found[:MAX_FOLDERS]:
+    folders.append({"path": str(root / name), "name": folder_name(name), "base": False})
+  return {"ok": True, "error": "", "folders": folders, "more": max(0, len(found) - MAX_FOLDERS)}
+
+
 # ---------- launch ----------
 
 def launch_config(model: str) -> str:
@@ -526,7 +599,7 @@ def launch_script(model: str, directory: str) -> str:
   # applies; the shared background service ignores per-launch config. The
   # session still lands in opencode's normal session list.
   return "\n".join([
-    f"cd -- {shq(directory)} || {{ printf 'Folder not found: %s\\n' {shq(directory)}; read -r _; exit 1; }}",
+    f"cd -- {shq(directory)} || {{ printf 'Cannot open folder: %s\\n' {shq(directory)}; read -r _; exit 1; }}",
     f"export OPENCODE_CONFIG_CONTENT={shq(launch_config(model))}",
     "opencode --standalone",
     "status=$?",
@@ -543,12 +616,11 @@ def launch(model: str, directory: str) -> dict:
     return {"ok": False, "error": "Ollama isn't answering."}
   if model not in {str(m.get("name")) for m in tags if isinstance(m, dict)}:
     return {"ok": False, "error": "That model isn't installed."}
-  folder = Path(os.path.expanduser(directory or "~/Projects"))
-  if not folder.is_absolute():
-    folder = Path.home() / folder
-  folder = folder.resolve()
+  folder = resolve_folder(directory)
   if not folder.is_dir():
-    return {"ok": False, "error": f"Folder not found: {folder}"}
+    return {"ok": False, "error": f"Folder not found: {folder_name(display_path(folder), 200)}"}
+  if not can_enter(folder):
+    return {"ok": False, "error": f"Can't open {folder_name(display_path(folder), 200)}: permission denied"}
   try:
     subprocess.Popen(
       ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "-e", "bash", "-lc", launch_script(model, str(folder))],
@@ -567,6 +639,8 @@ def run(argv: list[str]) -> tuple[dict, int]:
     return descriptions(argv[2:]), 0
   if command == "credit":
     return credit(force="--force" in argv), 0
+  if command == "folders":
+    return list_folders(argv[2] if len(argv) > 2 else ""), 0
   if command == "launch" and len(argv) >= 3:
     result = launch(argv[2], argv[3] if len(argv) > 3 else "")
     return result, 0 if result["ok"] else 2

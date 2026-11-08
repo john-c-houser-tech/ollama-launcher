@@ -4,7 +4,7 @@ An Omarchy bar widget that does three things:
 
 - Shows the **Ollama Cloud credit** you have left, as the Nerd Font rocket (U+F135) followed by the amount, such as `$60`, with the allowance and reset date in the tooltip. The amount dims when the reading is stale or missing.
 - Lists your **local Ollama models**, each with the description from its ollama.com library page and the facts that matter for coding with it: size, quantization, the context it actually runs with, and tool support.
-- Opens **opencode on a model in one click** (or ↵ / Space), in `~/Projects` by default.
+- Opens **opencode on a model in one click** (or ↵ / Space), in `~/Projects` by default. The **Start in** line at the top of the panel (or `f`) switches to a list of the `projectDir` folder and its subfolders that you can enter, most recently worked in first (a git repo counts from its last stage or checkout; the 40 most recent are shown). A folder picked there applies until the panel closes; every opening starts at `projectDir` again.
 
 Models that won't work well in opencode are listed last, with a warning:
 

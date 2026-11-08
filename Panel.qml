@@ -23,6 +23,19 @@ Panel {
   property real lastMouseY: -1
   property bool hoverArmed: false
   property bool descriptionsTried: false
+  // Folder picker. Every opening starts in projectDir; a pick applies to the
+  // launches from this opening only.
+  property bool picking: false
+  property var folders: []
+  property int folderIndex: 0
+  property string folderError: ""
+  property int moreFolders: 0
+  // Set once the user moves in the folder list, so a late answer doesn't
+  // jump the highlight away from what they're looking at.
+  property bool folderMoved: false
+  property string startPath: ""
+  property string startName: ""
+  readonly property string startLabel: root.startName !== "" ? root.startName : root.projectDir
 
   readonly property var credit: hostWidget ? hostWidget.credit : ({})
   readonly property string projectDir: hostWidget ? hostWidget.projectDir : "~/Projects"
@@ -40,6 +53,12 @@ Panel {
     hoverArm.restart()
     root.launchError = ""
     root.descriptionsTried = false
+    root.picking = false
+    root.startPath = ""
+    root.startName = ""
+    root.folders = []
+    root.folderError = ""
+    root.moreFolders = 0
     refresh()
     if (hostWidget) hostWidget.refreshCredit()
   }
@@ -72,12 +91,38 @@ Panel {
   function launch(model) {
     if (!model || launchProc.running) return
     root.launchError = ""
-    launchProc.command = ["python3", "-I", "-B", root.helper, "launch", String(model.name), root.projectDir]
+    launchProc.command = ["python3", "-I", "-B", root.helper, "launch", String(model.name),
+                          root.startPath !== "" ? root.startPath : root.projectDir]
     launchProc.running = true
   }
 
   function launchSelected() {
     if (root.models.length > 0) launch(root.models[root.selectedIndex])
+  }
+
+  function togglePicker() {
+    if (root.picking) { root.picking = false; return }
+    root.picking = true
+    root.folderIndex = 0
+    root.folderMoved = false
+    root.folderError = ""
+    if (!folderProc.running) {
+      folderProc.killed = false
+      folderProc.command = ["python3", "-I", "-B", root.helper, "folders", root.projectDir]
+      folderProc.running = true
+    }
+  }
+
+  function chooseFolder(folder) {
+    if (!folder) return
+    root.startPath = folder.base === true ? "" : String(folder.path)
+    root.startName = folder.base === true ? "" : String(folder.name)
+    root.launchError = ""
+    root.picking = false
+  }
+
+  function chooseSelectedFolder() {
+    if (root.folders.length > 0) chooseFolder(root.folders[root.folderIndex])
   }
 
   function creditLine() {
@@ -152,6 +197,45 @@ Panel {
     }
   }
 
+  Timer {
+    id: folderDeadline
+    interval: 5000
+    onTriggered: if (folderProc.running) {
+      folderProc.killed = true  // its partial output must not replace this message
+      folderProc.running = false
+      root.folderError = "Timed out reading folders."
+    }
+  }
+
+  Process {
+    id: folderProc
+    property bool killed: false
+    onRunningChanged: running ? folderDeadline.restart() : folderDeadline.stop()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (folderProc.killed) return
+        try {
+          var parsed = JSON.parse(text.length > 262144 ? "{}" : text)
+          root.folders = Array.isArray(parsed.folders) ? parsed.folders.slice(0, 50) : []
+          root.moreFolders = Math.max(0, Math.floor(Number(parsed.more) || 0))
+          root.folderError = parsed.ok === true ? "" : String(parsed.error || "Couldn't list folders.")
+        } catch (e) {
+          root.folders = []
+          root.folderError = "Couldn't read the helper's answer."
+        }
+        if (root.folderMoved) {
+          root.folderIndex = Math.min(root.folderIndex, Math.max(0, root.folders.length - 1))
+          return
+        }
+        // Start the highlight on the folder in use.
+        root.folderIndex = 0
+        for (var i = 0; i < root.folders.length; i++)
+          if (root.startPath !== "" && String(root.folders[i].path) === root.startPath) root.folderIndex = i
+      }
+    }
+  }
+
   Process {
     id: launchProc
     stdout: StdioCollector {
@@ -182,16 +266,27 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      // Esc backs out of the folder list before it closes the panel.
+      onCloseRequested: root.picking ? root.picking = false : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
-        if (dy !== 0 && root.models.length > 0)
+        if (dy === 0) return
+        if (root.picking) {
+          if (root.folders.length > 0) {
+            root.folderMoved = true
+            root.folderIndex = Math.max(0, Math.min(root.folders.length - 1, root.folderIndex + dy))
+          }
+        } else if (root.models.length > 0) {
           root.selectedIndex = Math.max(0, Math.min(root.models.length - 1, root.selectedIndex + dy))
+        }
       }
       // Return emits both returnRequested and activateRequested; Space only
-      // the latter. One handler, so Return can't launch twice.
-      onActivateRequested: root.launchSelected()
-      onTextKey: function(text) { if (text === "r") root.refresh() }
+      // the latter. One handler, so Return can't act twice.
+      onActivateRequested: root.picking ? root.chooseSelectedFolder() : root.launchSelected()
+      onTextKey: function(text) {
+        if (text === "f") root.togglePicker()
+        else if (text === "r" && !root.picking) root.refresh()
+      }
 
       Column {
         id: column
@@ -208,7 +303,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Local models"
+            text: root.picking ? "Start opencode in" : "Local models"
             textFormat: Text.PlainText
             color: root.fg
             font.family: root.fontFamily
@@ -228,13 +323,161 @@ Panel {
           }
         }
 
+        // ---- Start folder: click (or f) to choose another one.
+        Rectangle {
+          x: Style.space(8)
+          width: parent.width - Style.space(16)
+          height: startRow.implicitHeight + Style.space(12)
+          radius: Style.cornerRadius
+          color: (startArea.containsMouse || root.picking) ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+          border.width: 1
+          border.color: Qt.darker(root.fg, 1.9)
+
+          Row {
+            id: startRow
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(8)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            Text {
+              text: "Start in"
+              textFormat: Text.PlainText
+              color: root.dimmed
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              width: startRow.width - x - changeHint.implicitWidth - startRow.spacing
+              text: root.startLabel
+              textFormat: Text.PlainText
+              elide: Text.ElideMiddle
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              id: changeHint
+              text: root.picking ? "esc back" : "f change"
+              textFormat: Text.PlainText
+              color: root.dimmed
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+
+          MouseArea {
+            id: startArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.togglePicker()
+          }
+        }
+
         PanelSeparator { width: parent.width }
+
+        // ---- Folder rows (while choosing).
+        ListView {
+          id: folderList
+          visible: root.picking
+          width: parent.width
+          height: visible ? Math.min(contentHeight, Style.space(420)) : 0
+          clip: true
+          spacing: Style.space(2)
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.folders
+          currentIndex: root.folderIndex
+          onCurrentIndexChanged: if (count > 0) positionViewAtIndex(currentIndex, ListView.Contain)
+
+          delegate: Rectangle {
+            id: folderRow
+            required property var modelData
+            required property int index
+            readonly property bool current: index === root.folderIndex
+            readonly property bool inUse: modelData.base === true ? root.startPath === "" : String(modelData.path) === root.startPath
+
+            width: folderList.width
+            height: folderName.implicitHeight + Style.space(14)
+            radius: Style.cornerRadius
+            color: (current || folderArea.containsMouse) ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+
+            Text {
+              id: folderName
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(16)
+              anchors.right: folderMark.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: String(folderRow.modelData.name || "")
+              textFormat: Text.PlainText
+              elide: Text.ElideMiddle
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: folderRow.current
+            }
+
+            Text {
+              id: folderMark
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(16)
+              anchors.verticalCenter: parent.verticalCenter
+              text: folderRow.inUse ? "✓" : (folderRow.modelData.base === true ? "default" : "")
+              textFormat: Text.PlainText
+              color: folderRow.inUse ? Color.accent : root.dimmed
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            MouseArea {
+              id: folderArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onPositionChanged: function(mouse) {
+                if (!root.hoverArmed) return
+                var g = folderArea.mapToGlobal(mouse.x, mouse.y)
+                if (g.x !== root.lastMouseX || g.y !== root.lastMouseY) {
+                  root.lastMouseX = g.x
+                  root.lastMouseY = g.y
+                  root.folderMoved = true
+                  root.folderIndex = folderRow.index
+                }
+              }
+              onClicked: root.chooseFolder(folderRow.modelData)
+            }
+          }
+        }
+
+        Text {
+          x: Style.space(16)
+          width: parent.width - Style.space(32)
+          visible: root.picking && text !== ""
+          text: folderProc.running && root.folders.length === 0 ? "Reading folders…"
+            : (root.folderError !== "" ? root.folderError
+            : (root.moreFolders > 0 ? "+ " + root.moreFolders + " older folders not shown" : ""))
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          color: root.dimmed
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
 
         // ---- Model rows.
         ListView {
           id: modelList
+          visible: !root.picking
           width: parent.width
-          height: Math.min(contentHeight, Style.space(520))
+          height: visible ? Math.min(contentHeight, Style.space(520)) : 0
           clip: true
           spacing: Style.space(2)
           boundsBehavior: Flickable.StopAtBounds
@@ -343,7 +586,7 @@ Panel {
         Text {
           x: Style.space(16)
           width: parent.width - Style.space(32)
-          visible: text !== ""
+          visible: !root.picking && text !== ""
           text: root.loading && root.models.length === 0 ? "Reading models…"
             : (root.error !== "" ? root.error
             : (root.models.length === 0 ? "No local models. Pull one with: ollama pull <model>" : ""))
@@ -357,7 +600,7 @@ Panel {
         Text {
           x: Style.space(16)
           width: parent.width - Style.space(32)
-          visible: root.launchError !== ""
+          visible: !root.picking && root.launchError !== ""
           text: root.launchError
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
@@ -379,7 +622,8 @@ Panel {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(16)
             anchors.verticalCenter: parent.verticalCenter
-            text: "Click or ↵ opens opencode in " + root.projectDir + " · r refresh · esc"
+            text: root.picking ? "↵ choose · ↑↓ move · esc back"
+              : "Click or ↵ opens opencode · f folder · r refresh · esc"
             textFormat: Text.PlainText
             elide: Text.ElideMiddle
             color: root.dimmed
