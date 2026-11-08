@@ -229,7 +229,7 @@ class Credit(TempCache):
 
   def http_error(self, code, retry=None):
     headers = {"Retry-After": str(retry)} if retry else {}
-    return urllib.error.HTTPError(ol.BALANCE_URL, code, "x", headers, io.BytesIO(b""))
+    return urllib.error.HTTPError(ol.BALANCE_URL, code, "x", headers, None)
 
   def test_parse_balance(self):
     record = ol.parse_balance(self.BALANCE)
@@ -298,6 +298,7 @@ class Credit(TempCache):
 
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    self.addCleanup(server.server_close)
     self.addCleanup(server.shutdown)
     url = f"http://127.0.0.1:{server.server_port}/api/balance"
     with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -471,6 +472,22 @@ class Folders(TempCache):
       code = ol.main(["x", "folders", str(root)])
     self.assertEqual(code, 0)
     self.assertEqual([f["name"] for f in json.loads(out.getvalue())["folders"]][1:], ["one"])
+
+
+class Manifest(unittest.TestCase):
+  """What Omarchy needs from manifest.json; runs in the hook and in CI, where
+  `omarchy plugin validate` isn't available."""
+
+  def test_manifest(self):
+    manifest = json.loads((HELPER.parent / "manifest.json").read_text())
+    self.assertEqual(manifest["schemaVersion"], 1)
+    self.assertEqual(manifest["id"], "io.github.john-c-houser-tech.ollama-launcher")
+    self.assertEqual(manifest["kinds"], ["bar-widget"])
+    entry = manifest["entryPoints"]["barWidget"]
+    self.assertEqual(entry, "BarWidget.qml")
+    self.assertTrue((HELPER.parent / entry).is_file())
+    keys = {item["key"] for item in manifest["barWidget"]["schema"]}
+    self.assertEqual(keys, set(manifest["barWidget"]["defaults"]))
 
 
 class Main(unittest.TestCase):

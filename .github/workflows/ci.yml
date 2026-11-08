@@ -1,6 +1,7 @@
-# CI: the helper's tests, the manifest and a bidi scan. No secrets, no network
-# beyond the checkout: the tests answer Ollama and ollama.com with made-up data
-# and stub the terminal. The ruleset on main requires the one "CI result" check.
+# CI: the helper's tests (which include the manifest checks) and a bidi scan.
+# No secrets, no network beyond the checkout: the tests answer Ollama and
+# ollama.com with made-up data and stub the terminal. The ruleset on main
+# requires the one "CI result" check; keep that job's name.
 name: CI
 
 on:
@@ -20,6 +21,7 @@ jobs:
   tests:
     name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -32,32 +34,30 @@ jobs:
       - name: Tests
         run: python -I -B -m unittest discover -s tests -v
 
-  checks:
-    name: Manifest and bidi scan
+  bidi:
+    name: Bidi scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: manifest.json is valid JSON with the plugin id
-        run: |
-          python3 -I - <<'EOF'
-          import json
-          manifest = json.load(open("manifest.json"))
-          assert manifest["id"] == "io.github.john-c-houser-tech.ollama-launcher", manifest["id"]
-          assert manifest["entryPoints"]["barWidget"] == "BarWidget.qml"
-          EOF
       - name: No bidi control characters
+        # git grep: 0 = match, 1 = none, anything else = it couldn't run.
         run: |
-          if git ls-files -z | xargs -0 grep -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]'; then
-            echo "The files above contain bidi control characters."
-            exit 1
-          fi
+          status=0
+          git grep -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' || status=$?
+          case "$status" in
+            0) echo "The files above contain bidi control characters."; exit 1 ;;
+            1) echo "No bidi control characters." ;;
+            *) echo "The bidi scan could not run (git grep exit $status)."; exit 1 ;;
+          esac
 
   # The one check main's ruleset requires.
   result:
     name: CI result
     if: always()
-    needs: [tests, checks]
+    needs: [tests, bidi]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Every job passed or was skipped
         env:
