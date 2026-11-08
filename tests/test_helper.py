@@ -229,7 +229,9 @@ class Credit(TempCache):
 
   def http_error(self, code, retry=None):
     headers = {"Retry-After": str(retry)} if retry else {}
-    return urllib.error.HTTPError(ol.BALANCE_URL, code, "x", headers, None)
+    error = urllib.error.HTTPError(ol.BALANCE_URL, code, "x", headers, None)
+    self.addCleanup(error.close)  # it wraps a buffer even without a body
+    return error
 
   def test_parse_balance(self):
     record = ol.parse_balance(self.BALANCE)
