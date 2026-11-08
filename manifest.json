@@ -3,7 +3,7 @@
   "id": "io.github.john-c-houser-tech.ollama-launcher",
   "name": "Ollama Launcher",
   "version": "0.1.0",
-  "author": "John Houser",
+  "author": "John C. Houser",
   "license": "MIT",
   "description": "Your local Ollama models with a short description of each, opencode on any of them in one click, and the Ollama Cloud credit you have left.",
   "kinds": ["bar-widget"],

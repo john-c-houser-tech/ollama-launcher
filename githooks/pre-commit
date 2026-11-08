@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs before every commit: the tests (which include the manifest checks),
+# `omarchy plugin validate` when Omarchy is installed, and a scan of the
+# staged files for bidi control characters.
+# Enable with: git config core.hooksPath githooks
+#
+# The tests run on the working tree, so unstaged edits count; CI runs them on
+# exactly what was pushed.
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if ! python3 -I -B -m unittest discover -s tests -q; then
+  echo "pre-commit: tests failed (output above)" >&2
+  exit 1
+fi
+
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate "$ROOT" >/dev/null || { echo "pre-commit: omarchy plugin validate failed" >&2; exit 1; }
+fi
+
+# U+202A-U+202E and U+2066-U+2069 can make code read differently from how it
+# runs. git grep exits 0 on a match, 1 on none, and anything else on an error,
+# which must not pass as clean.
+status=0
+git grep --cached -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' || status=$?
+case "$status" in
+  0) echo "pre-commit: the staged files above contain bidi control characters" >&2; exit 1 ;;
+  1) ;;
+  *) echo "pre-commit: the bidi scan could not run (git grep exit $status)" >&2; exit 1 ;;
+esac
+
+echo "pre-commit: tests, manifest and bidi scan passed"
