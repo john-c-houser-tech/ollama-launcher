@@ -1,49 +1,63 @@
 #!/usr/bin/env python3
 """Helper for the Ollama Launcher bar widget.
 
-Commands (each prints one JSON object on stdout and exits 0, except launch):
-  models   Local Ollama models with a short description and the facts that
-           matter for picking one for opencode (size, context, tool support).
-  credit   Ollama Cloud credit left, from ollama.com/api/balance.
+Commands (each prints one JSON object on stdout):
+  models        Local Ollama models with their cached description and the
+                facts that matter for picking one for opencode. Local only:
+                never waits on the network.
+  descriptions  Fetch missing or week-old descriptions from ollama.com, within
+                a fixed time budget, caching each one as it arrives.
+  credit        Ollama Cloud credit left, from ollama.com/api/balance.
   launch <model> <directory>
-           Open a terminal running opencode on that local model.
+                Open a terminal running opencode on that local model.
 
 Network use, all over HTTPS with timeouts and size limits:
   - ollama.com/api/balance with the API key in
-    ~/.config/omarchy/ollama-usage/api.key (credit; cached 60 s so several
-    bars on several monitors share one request).
-  - ollama.com/library/<model> page description, at most once a week per
-    model family, cached in ~/.cache/omarchy/ollama-launcher/. Skipped with
-    --no-descriptions.
+    ~/.config/omarchy/ollama-usage/api.key. Answers and failures are cached
+    under a lock, so bars on several monitors share one request and a rate
+    limit (429) is waited out, not hammered.
+  - ollama.com/library/<name> page description, at most once a week per
+    model family. A local model with no parent model is looked up under its
+    own name.
 Everything else talks to the local Ollama at 127.0.0.1:11434.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import html
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 OLLAMA = "http://127.0.0.1:11434"
 BALANCE_URL = "https://ollama.com/api/balance"
-LIBRARY_URL = "https://ollama.com/library/"
+SITE = "https://ollama.com/"
 USER_AGENT = "omarchy-ollama-launcher"
 KEY_FILE = Path(os.environ.get("OLLAMA_LAUNCHER_KEY_FILE") or Path.home() / ".config/omarchy/ollama-usage/api.key")
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy/ollama-launcher"
+CACHE_DIR = Path(os.environ.get("OLLAMA_LAUNCHER_CACHE") or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy/ollama-launcher")
 LOCAL_TIMEOUT = 5
-REMOTE_TIMEOUT = 10
+REMOTE_TIMEOUT = 8
 MAX_BYTES = 1 << 20
-CREDIT_CACHE_SEC = 60
+MAX_MODELS = 100
+CREDIT_FRESH_SEC = 60
+CREDIT_ERROR_BACKOFF_SEC = 120
+CREDIT_AUTH_BACKOFF_SEC = 900
+CREDIT_MAX_BACKOFF_SEC = 3600
 DESCRIPTION_TTL_SEC = 7 * 86400
 DESCRIPTION_RETRY_SEC = 86400
+# Hard wall-clock cap on the descriptions command, DNS included: the socket
+# timeout bounds each read, not a whole slow-drip request or a name lookup.
+DESCRIPTIONS_BUDGET_SEC = 12
 MAX_DESCRIPTION = 280
 # Measured on this machine (Ollama 0.40.7): a model without num_ctx loads with
 # 4096 tokens unless the server sets OLLAMA_CONTEXT_LENGTH.
@@ -58,22 +72,67 @@ LIBRARY_NAME = re.compile(r"^[a-z0-9][a-z0-9._\-]{0,80}(/[a-z0-9][a-z0-9._\-]{0,
 META_DESCRIPTION = re.compile(r'<meta\s+name="description"\s+content="([^"]{1,2000})"', re.IGNORECASE)
 
 
+class Budget(Exception):
+  pass
+
+
 # ---------- small utilities ----------
 
 def now() -> dt.datetime:
   return dt.datetime.now(dt.timezone.utc)
 
 
-def fetch_json(url: str, timeout: float, headers: dict | None = None, body: dict | None = None) -> dict:
-  data = json.dumps(body).encode() if body is not None else None
-  request = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, "Accept": "application/json", **(headers or {})})
-  if data is not None:
-    request.add_header("Content-Type", "application/json")
-  with urllib.request.urlopen(request, timeout=timeout) as response:
-    raw = response.read(MAX_BYTES + 1)
+def stamp(at: dt.datetime | None = None) -> str:
+  return (at or now()).isoformat(timespec="seconds")
+
+
+def parse_time(value) -> dt.datetime | None:
+  try:
+    parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  return parsed if parsed.tzinfo else None
+
+
+def age_sec(value) -> float:
+  """Seconds since a stored time; a missing or future time counts as never,
+  so a clock that was wrong when the cache was written can't freeze it."""
+  parsed = parse_time(value)
+  if not parsed:
+    return float("inf")
+  age = (now() - parsed).total_seconds()
+  return age if age >= 0 else float("inf")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None  # urllib then raises HTTPError for the 3xx
+
+
+_no_redirect = urllib.request.build_opener(NoRedirect)
+
+
+def read_limited(response) -> bytes:
+  raw = response.read(MAX_BYTES + 1)
   if len(raw) > MAX_BYTES:
     raise ValueError("response too large")
-  payload = json.loads(raw)
+  return raw
+
+
+def fetch_json(url: str, timeout: float, body: dict | None = None, key: str = "") -> dict:
+  data = json.dumps(body).encode() if body is not None else None
+  request = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+  if data is not None:
+    request.add_header("Content-Type", "application/json")
+  opener = urllib.request.urlopen
+  if key:
+    # The key must never follow a redirect to another host.
+    request.add_unredirected_header("Authorization", f"Bearer {key}")
+    opener = _no_redirect.open
+  with opener(request, timeout=timeout) as response:
+    if key and not response.geturl().startswith(SITE):
+      raise ValueError("unexpected host")
+    payload = json.loads(read_limited(response))
   if not isinstance(payload, dict):
     raise ValueError("unexpected response shape")
   return payload
@@ -94,27 +153,52 @@ def read_cache(name: str) -> dict:
 
 
 def write_cache(name: str, value: dict) -> None:
+  tmp = None
   try:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=f".{name}.")
     with os.fdopen(fd, "w") as handle:
       json.dump(value, handle)
     os.replace(tmp, CACHE_DIR / name)
-  except OSError:
+    tmp = None
+  except (OSError, ValueError, TypeError):
     pass  # a cache that can't be written just means fetching again
+  finally:
+    if tmp:
+      try:
+        os.unlink(tmp)
+      except OSError:
+        pass
 
 
-def age_sec(stamp) -> float:
-  try:
-    parsed = dt.datetime.fromisoformat(str(stamp))
-  except ValueError:
-    return float("inf")
-  return (now() - parsed).total_seconds() if parsed.tzinfo else float("inf")
+class Lock:
+  """Exclusive lock on a file in the cache folder, so bars on several
+  monitors don't each make the same request."""
+  def __init__(self, name: str):
+    self.name = name
+    self.handle = None
+
+  def __enter__(self):
+    try:
+      CACHE_DIR.mkdir(parents=True, exist_ok=True)
+      self.handle = open(CACHE_DIR / self.name, "a")
+      fcntl.flock(self.handle, fcntl.LOCK_EX)
+    except OSError:
+      self.handle = None  # unlocked is still correct, just less shared
+    return self
+
+  def __exit__(self, *exc):
+    if self.handle:
+      self.handle.close()
 
 
 def clean_text(value, limit: int) -> str:
-  """Plain, single-line, length-capped text for display."""
-  text = re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
+  """Plain, single-line, length-capped text for display, without control or
+  bidirectional-formatting characters that could make it read differently."""
+  text = html.unescape(str(value or ""))
+  text = "".join(" " if unicodedata.category(ch) in ("Cc", "Zl", "Zp") else ch
+                 for ch in text if unicodedata.category(ch) != "Cf")
+  text = re.sub(r"\s+", " ", text).strip()
   return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
@@ -123,9 +207,13 @@ def shq(text: str) -> str:
 
 
 def human_bytes(n) -> str:
+  if isinstance(n, bool):
+    return ""
   try:
     n = float(n)
   except (TypeError, ValueError):
+    return ""
+  if n != n or n < 0:
     return ""
   for unit in ("B", "KB", "MB", "GB", "TB"):
     if n < 1000 or unit == "TB":
@@ -140,17 +228,31 @@ def short_tokens(n: int) -> str:
 
 # ---------- models ----------
 
+def context_setting(text: str) -> int | None:
+  match = re.search(r"(?:^|\s|\")OLLAMA_CONTEXT_LENGTH=\"?(\d{3,7})\b", text, re.MULTILINE)
+  return int(match.group(1)) if match else None
+
+
 def server_default_context() -> tuple[int, str]:
   """Context Ollama gives a model with no num_ctx: OLLAMA_CONTEXT_LENGTH from
-  the user unit's environment when set, otherwise Ollama's own default."""
+  the user unit (inline or in an EnvironmentFile), else Ollama's default."""
   try:
-    out = subprocess.run(["systemctl", "--user", "show", "ollama", "-p", "Environment"],
+    out = subprocess.run(["systemctl", "--user", "show", "ollama", "-p", "Environment", "-p", "EnvironmentFiles"],
                          capture_output=True, text=True, timeout=3).stdout
-    match = re.search(r"\bOLLAMA_CONTEXT_LENGTH=(\d{3,7})\b", out)
-    if match:
-      return int(match.group(1)), "server setting"
   except (OSError, subprocess.TimeoutExpired):
-    pass
+    out = ""
+  value = None
+  for line in out.splitlines():
+    if line.startswith("Environment="):
+      value = context_setting(line[len("Environment="):]) or value
+    elif line.startswith("EnvironmentFiles="):
+      path = line[len("EnvironmentFiles="):].split(" (", 1)[0].strip()
+      try:
+        value = context_setting(Path(path).read_text()[:65536]) or value
+      except (OSError, UnicodeDecodeError):
+        pass
+  if value:
+    return value, "server setting"
   return OLLAMA_DEFAULT_CONTEXT, "Ollama default"
 
 
@@ -178,39 +280,61 @@ def library_name(name: str, parent: str) -> str:
   return base if LIBRARY_NAME.match(base) else ""
 
 
+def library_url(family: str) -> str:
+  return SITE + ("library/" + family if "/" not in family else family)
+
+
 def parse_description(page: str) -> str:
   match = META_DESCRIPTION.search(page)
   return clean_text(match.group(1), MAX_DESCRIPTION) if match else ""
 
 
-def descriptions_for(families: set[str], allow_network: bool) -> dict[str, str]:
-  cache = read_cache("library.json")
-  entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
-  changed = False
-  out = {}
-  for family in sorted(families):
-    entry = entries.get(family) if isinstance(entries.get(family), dict) else {}
-    fresh = age_sec(entry.get("checkedAt")) < (DESCRIPTION_TTL_SEC if entry.get("text") else DESCRIPTION_RETRY_SEC)
-    if allow_network and not fresh:
-      url = LIBRARY_URL + family if "/" not in family else "https://ollama.com/" + family
-      try:
-        text = parse_description(fetch_text(url, REMOTE_TIMEOUT))
-      except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        text = entry.get("text") or ""  # keep the old text through an outage
-      entry = {"text": text, "checkedAt": now().isoformat(timespec="seconds")}
-      entries[family] = entry
-      changed = True
-    out[family] = clean_text(entry.get("text"), MAX_DESCRIPTION)
-  if changed:
-    write_cache("library.json", {"entries": entries})
-  return out
+def description_entries() -> dict:
+  entries = read_cache("library.json").get("entries")
+  return entries if isinstance(entries, dict) else {}
+
+
+def description_due(entry) -> bool:
+  entry = entry if isinstance(entry, dict) else {}
+  return age_sec(entry.get("checkedAt")) >= (DESCRIPTION_TTL_SEC if entry.get("text") else DESCRIPTION_RETRY_SEC)
+
+
+def fetch_descriptions(families: list[str]) -> int:
+  """Fetch due descriptions one by one, saving each, until the budget runs
+  out. Returns how many entries changed."""
+  changed = 0
+
+  def out_of_time(signum, frame):
+    raise Budget()
+
+  previous = signal.signal(signal.SIGALRM, out_of_time)
+  signal.alarm(DESCRIPTIONS_BUDGET_SEC)
+  try:
+    with Lock(".library.lock"):
+      for family in families:
+        entries = description_entries()  # re-read: another run may have filled it
+        entry = entries.get(family) if isinstance(entries.get(family), dict) else {}
+        if not description_due(entry):
+          continue
+        try:
+          text = parse_description(fetch_text(library_url(family), REMOTE_TIMEOUT))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+          text = entry.get("text") or ""  # keep the old text through an outage
+        entries[family] = {"text": text, "checkedAt": stamp()}
+        write_cache("library.json", {"entries": entries})
+        changed += 1
+  except Budget:
+    pass
+  finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, previous)
+  return changed
 
 
 def advice(model: dict, siblings: list[dict]) -> list[str]:
   notes = []
   if model["context"] < MIN_OPENCODE_CONTEXT:
-    better = [s for s in siblings if s["context"] >= MIN_OPENCODE_CONTEXT]
-    better.sort(key=lambda s: s["context"])
+    better = sorted((s for s in siblings if s["context"] >= MIN_OPENCODE_CONTEXT), key=lambda s: s["context"])
     note = (f"Only {short_tokens(model['context'])} context: opencode's instructions can be cut off "
             "without warning, and the model then looks bad at coding.")
     if better:
@@ -223,35 +347,46 @@ def advice(model: dict, siblings: list[dict]) -> list[str]:
   return notes
 
 
-def list_models(allow_network: bool) -> dict:
+def is_cloud(tag: dict, name: str) -> bool:
+  tag_part = name.split(":", 1)[1] if ":" in name else ""
+  return bool(tag.get("remote_host")) or tag_part == "cloud" or tag_part.endswith("-cloud")
+
+
+def as_list(value) -> list:
+  return value if isinstance(value, list) else []
+
+
+def list_models() -> dict:
   try:
     tags = fetch_json(f"{OLLAMA}/api/tags", LOCAL_TIMEOUT)
   except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-    return {"ok": False, "error": "Ollama isn't answering at 127.0.0.1:11434.", "models": []}
+    return {"ok": False, "error": "Ollama isn't answering at 127.0.0.1:11434.", "models": [], "descriptionsDue": False}
   try:
-    loaded = {m.get("name"): m for m in fetch_json(f"{OLLAMA}/api/ps", LOCAL_TIMEOUT).get("models") or [] if isinstance(m, dict)}
+    running = as_list(fetch_json(f"{OLLAMA}/api/ps", LOCAL_TIMEOUT).get("models"))
   except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-    loaded = {}
+    running = []
+  loaded = {str(m.get("name")): m for m in running if isinstance(m, dict)}
   default_ctx, default_source = server_default_context()
 
   models = []
-  for tag in (tags.get("models") or [])[:100]:
+  for tag in as_list(tags.get("models"))[:MAX_MODELS]:
     if not isinstance(tag, dict):
       continue
     name = str(tag.get("name") or "")
-    if not MODEL_NAME.match(name) or tag.get("remote_host") or name.endswith(":cloud") or "-cloud" in name.split(":")[-1]:
-      continue  # local models only; cloud models aren't the point here
+    if not MODEL_NAME.match(name) or is_cloud(tag, name):
+      continue  # local models only
     details = tag.get("details") if isinstance(tag.get("details"), dict) else {}
     try:
       show = fetch_json(f"{OLLAMA}/api/show", LOCAL_TIMEOUT, body={"model": name})
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
       show = {}
     show_details = show.get("details") if isinstance(show.get("details"), dict) else {}
-    capabilities = show.get("capabilities") if isinstance(show.get("capabilities"), list) else []
+    capabilities = as_list(show.get("capabilities"))
     set_ctx = num_ctx_from(show.get("parameters"))
     run = loaded.get(name) or {}
-    if isinstance(run.get("context_length"), int) and run["context_length"] > 0:
-      context, context_source = run["context_length"], "loaded now"
+    run_ctx = run.get("context_length")
+    if isinstance(run_ctx, int) and not isinstance(run_ctx, bool) and 0 < run_ctx < 10_000_000:
+      context, context_source = run_ctx, "loaded now"
     elif set_ctx:
       context, context_source = set_ctx, "set on the model"
     else:
@@ -267,27 +402,33 @@ def list_models(allow_network: bool) -> dict:
       "contextSource": context_source,
       "tools": "tools" in capabilities,
       "loaded": name in loaded,
-      "modifiedAt": str(tag.get("modified_at") or "")[:40],
     })
 
-  descriptions = descriptions_for({m["family"] for m in models if m["family"]}, allow_network)
+  entries = description_entries()
+  families = sorted({m["family"] for m in models if m["family"]})
   for model in models:
     siblings = [s for s in models if s is not model and s["blob"] and s["blob"] == model["blob"]]
-    model["description"] = descriptions.get(model["family"], "")
+    entry = entries.get(model["family"]) if isinstance(entries.get(model["family"]), dict) else {}
+    model["description"] = clean_text(entry.get("text"), MAX_DESCRIPTION)
     facts = [model["parameterSize"], model["quantization"], model["size"],
              f"{short_tokens(model['context'])} context ({model['contextSource']})",
              "tools" if model["tools"] else "no tools"]
     model["facts"] = " · ".join(f for f in facts if f)
     notes = advice(model, siblings)
     # One string, not a list: nested lists reach QML as a sequence type that
-    # Array.isArray rejects, which hid the warning.
+    # Array.isArray rejects, which once hid the warning.
     model["warning"] = " ".join(notes)
     model["ready"] = not notes
   for model in models:
     del model["blob"]
-  # Ready-to-code models first, then by name.
-  models.sort(key=lambda m: (not m["ready"], m["name"]))
-  return {"ok": True, "error": "", "models": models}
+  models.sort(key=lambda m: (not m["ready"], m["name"]))  # ready-to-code first
+  return {"ok": True, "error": "", "models": models, "families": families,
+          "descriptionsDue": any(description_due(entries.get(f)) for f in families)}
+
+
+def descriptions(families: list[str]) -> dict:
+  families = [f for f in families if LIBRARY_NAME.match(f)][:MAX_MODELS]
+  return {"ok": True, "changed": fetch_descriptions(families)}
 
 
 # ---------- credit ----------
@@ -312,99 +453,134 @@ def parse_balance(payload: dict) -> dict:
   if left is None and not bought:
     raise ValueError("no balance in response")
   period = included.get("period") if isinstance(included.get("period"), dict) else {}
-  until = str(period.get("until") or "")
-  try:
-    resets = dt.datetime.fromisoformat(until.replace("Z", "+00:00")).isoformat(timespec="seconds") if until else ""
-  except ValueError:
-    resets = ""
+  resets = parse_time(period.get("until")) if period.get("until") else None
   return {
-    "ok": True, "error": "",
     "includedLeftUsd": left or 0.0,
     "allowanceUsd": allowance or 0.0,
     "purchasedUsd": bought,
     "totalLeftUsd": round((left or 0.0) + bought, 2),
-    "resetsAt": resets,
+    "resetsAt": stamp(resets) if resets else "",
   }
 
 
-def credit(force: bool) -> dict:
-  cached = read_cache("credit.json")
-  if not force and cached.get("ok") and age_sec(cached.get("checkedAt")) < CREDIT_CACHE_SEC:
-    return cached
+def retry_after(error: urllib.error.HTTPError) -> int:
   try:
-    key = KEY_FILE.read_text().strip()
-  except OSError:
-    key = ""
-  if not key:
-    return {"ok": False, "error": f"No Ollama API key in {KEY_FILE}."}
-  try:
-    record = parse_balance(fetch_json(BALANCE_URL, REMOTE_TIMEOUT, headers={"Authorization": f"Bearer {key}"}))
-  except urllib.error.HTTPError as error:
-    message = "ollama.com rejected the API key." if error.code in (401, 403) else f"ollama.com answered HTTP {error.code}."
-    record = {"ok": False, "error": message}
-  except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-    record = {"ok": False, "error": "Couldn't read the balance from ollama.com."}
-  record["checkedAt"] = now().isoformat(timespec="seconds")
-  if record.get("ok"):
-    write_cache("credit.json", record)
-  elif cached.get("ok"):
-    # Keep showing the last good numbers, marked stale.
-    return {**cached, "stale": True, "error": record["error"]}
-  return record
+    seconds = int(str(error.headers.get("Retry-After") or "").strip())
+  except (ValueError, AttributeError):
+    seconds = 0
+  return max(CREDIT_ERROR_BACKOFF_SEC, min(seconds, CREDIT_MAX_BACKOFF_SEC))
+
+
+def credit_view(cache: dict) -> dict:
+  good = cache.get("good") if isinstance(cache.get("good"), dict) else None
+  error = str(cache.get("error") or "")
+  if good:
+    return {**good, "ok": True, "stale": bool(error), "error": error}
+  return {"ok": False, "stale": False, "error": error or "No reading yet."}
+
+
+def credit(force: bool = False) -> dict:
+  with Lock(".credit.lock"):
+    cache = read_cache("credit.json")
+    next_try = parse_time(cache.get("nextTryAt"))
+    due = (force or next_try is None or next_try <= now()
+           or (next_try - now()).total_seconds() > CREDIT_MAX_BACKOFF_SEC)  # clock skew guard
+    if not due:
+      return credit_view(cache)
+    try:
+      key = KEY_FILE.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+      key = ""
+    backoff = CREDIT_ERROR_BACKOFF_SEC
+    if not key:
+      cache["error"], backoff = f"No Ollama API key in {KEY_FILE}.", CREDIT_AUTH_BACKOFF_SEC
+    else:
+      try:
+        cache["good"] = {**parse_balance(fetch_json(BALANCE_URL, REMOTE_TIMEOUT, key=key)), "checkedAt": stamp()}
+        cache["error"], backoff = "", CREDIT_FRESH_SEC
+      except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+          cache["error"], backoff = "ollama.com rejected the API key.", CREDIT_AUTH_BACKOFF_SEC
+        elif 300 <= error.code < 400:
+          cache["error"] = "ollama.com redirected the balance request; not following it with the key."
+        else:
+          cache["error"], backoff = f"ollama.com answered HTTP {error.code}.", retry_after(error)
+      except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        cache["error"] = "Couldn't read the balance from ollama.com."
+    cache["nextTryAt"] = stamp(now() + dt.timedelta(seconds=backoff))
+    write_cache("credit.json", cache)
+    return credit_view(cache)
 
 
 # ---------- launch ----------
 
+def launch_config(model: str) -> str:
+  selection = {"providerID": OPENCODE_PROVIDER, "model": model}
+  # The title agent has its own model in opencode.json (an Anthropic one);
+  # pin it too, or the first message of a "local" session leaves the machine.
+  return json.dumps({"model": selection, "agents": {"title": {"model": selection}}}, separators=(",", ":"))
+
+
 def launch_script(model: str, directory: str) -> str:
-  config = json.dumps({"model": {"providerID": OPENCODE_PROVIDER, "model": model}}, separators=(",", ":"))
-  # --standalone gives this launch its own server, so the model choice above
+  # --standalone gives this launch its own server, so the model choice
   # applies; the shared background service ignores per-launch config. The
   # session still lands in opencode's normal session list.
   return "\n".join([
     f"cd -- {shq(directory)} || {{ printf 'Folder not found: %s\\n' {shq(directory)}; read -r _; exit 1; }}",
-    f"export OPENCODE_CONFIG_CONTENT={shq(config)}",
+    f"export OPENCODE_CONFIG_CONTENT={shq(launch_config(model))}",
     "opencode --standalone",
     "status=$?",
     "if [ \"$status\" -ne 0 ]; then printf '\\nopencode exited with status %s. Press Enter to close.' \"$status\"; read -r _; fi",
   ])
 
 
-def launch(model: str, directory: str) -> int:
+def launch(model: str, directory: str) -> dict:
   if not MODEL_NAME.match(model):
-    print(json.dumps({"ok": False, "error": "Not a model name."}))
-    return 2
+    return {"ok": False, "error": "Not a model name."}
   try:
-    names = {str(m.get("name")) for m in fetch_json(f"{OLLAMA}/api/tags", LOCAL_TIMEOUT).get("models") or [] if isinstance(m, dict)}
+    tags = as_list(fetch_json(f"{OLLAMA}/api/tags", LOCAL_TIMEOUT).get("models"))
   except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-    print(json.dumps({"ok": False, "error": "Ollama isn't answering."}))
-    return 1
-  if model not in names:
-    print(json.dumps({"ok": False, "error": "That model isn't installed."}))
-    return 2
+    return {"ok": False, "error": "Ollama isn't answering."}
+  if model not in {str(m.get("name")) for m in tags if isinstance(m, dict)}:
+    return {"ok": False, "error": "That model isn't installed."}
   folder = Path(os.path.expanduser(directory or "~/Projects"))
+  if not folder.is_absolute():
+    folder = Path.home() / folder
+  folder = folder.resolve()
   if not folder.is_dir():
-    print(json.dumps({"ok": False, "error": f"Folder not found: {folder}"}))
-    return 2
-  subprocess.Popen(
-    ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "-e", "bash", "-lc", launch_script(model, str(folder))],
-    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-  )
-  print(json.dumps({"ok": True, "error": ""}))
-  return 0
+    return {"ok": False, "error": f"Folder not found: {folder}"}
+  try:
+    subprocess.Popen(
+      ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "-e", "bash", "-lc", launch_script(model, str(folder))],
+      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+  except OSError as error:
+    return {"ok": False, "error": f"Couldn't open a terminal: {error.strerror or error}"}
+  return {"ok": True, "error": ""}
+
+
+def run(argv: list[str]) -> tuple[dict, int]:
+  command = argv[1] if len(argv) > 1 else ""
+  if command == "models":
+    return list_models(), 0
+  if command == "descriptions":
+    return descriptions(argv[2:]), 0
+  if command == "credit":
+    return credit(force="--force" in argv), 0
+  if command == "launch" and len(argv) >= 3:
+    result = launch(argv[2], argv[3] if len(argv) > 3 else "")
+    return result, 0 if result["ok"] else 2
+  print(__doc__, file=sys.stderr)
+  return {"ok": False, "error": "Unknown command."}, 2
 
 
 def main(argv: list[str]) -> int:
-  command = argv[1] if len(argv) > 1 else ""
-  if command == "models":
-    print(json.dumps(list_models(allow_network="--no-descriptions" not in argv)))
-    return 0
-  if command == "credit":
-    print(json.dumps(credit(force="--force" in argv)))
-    return 0
-  if command == "launch" and len(argv) >= 3:
-    return launch(argv[2], argv[3] if len(argv) > 3 else "")
-  print(__doc__, file=sys.stderr)
-  return 2
+  try:
+    result, code = run(argv)
+  except Exception as error:  # always answer with JSON so the panel can say what happened
+    result, code = {"ok": False, "error": f"Helper error: {type(error).__name__}"}, 1
+  print(json.dumps(result))
+  return code
 
 
 if __name__ == "__main__":

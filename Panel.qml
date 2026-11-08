@@ -22,6 +22,7 @@ Panel {
   property real lastMouseX: -1
   property real lastMouseY: -1
   property bool hoverArmed: false
+  property bool descriptionsTried: false
 
   readonly property var credit: hostWidget ? hostWidget.credit : ({})
   readonly property string projectDir: hostWidget ? hostWidget.projectDir : "~/Projects"
@@ -38,8 +39,9 @@ Panel {
     root.hoverArmed = false
     hoverArm.restart()
     root.launchError = ""
+    root.descriptionsTried = false
     refresh()
-    if (hostWidget) hostWidget.refreshCredit(false)
+    if (hostWidget) hostWidget.refreshCredit()
   }
   function openFromHotkey() { open() }
   function close() { root.controller.hide() }
@@ -53,15 +55,24 @@ Panel {
   function refresh() {
     if (listProc.running) return
     root.loading = true
-    var noFetch = hostWidget && hostWidget.fetchDescriptions === false
-    listProc.command = ["python3", "-I", root.helper, "models"].concat(noFetch ? ["--no-descriptions"] : [])
+    listProc.killed = false
+    listProc.command = ["python3", "-I", "-B", root.helper, "models"]
     listProc.running = true
+  }
+
+  // Descriptions come from ollama.com in a separate run, after the list is
+  // up, so a slow network never holds back the models. Once per opening.
+  function fetchDescriptions(families) {
+    if (root.descriptionsTried || descProc.running || !hostWidget || hostWidget.fetchDescriptions !== true) return
+    root.descriptionsTried = true
+    descProc.command = ["python3", "-I", "-B", root.helper, "descriptions"].concat(families.slice(0, 100))
+    descProc.running = true
   }
 
   function launch(model) {
     if (!model || launchProc.running) return
     root.launchError = ""
-    launchProc.command = ["python3", "-I", root.helper, "launch", String(model.name), root.projectDir]
+    launchProc.command = ["python3", "-I", "-B", root.helper, "launch", String(model.name), root.projectDir]
     launchProc.running = true
   }
 
@@ -78,31 +89,65 @@ Panel {
     var day = hostWidget.resetDay(c.resetsAt)
     if (day) line += " · resets " + day
     if (Number(c.purchasedUsd) > 0) line += " · includes " + hostWidget.money(c.purchasedUsd) + " purchased"
-    if (c.stale) line += " · last good reading"
+    if (c.stale) line += " · stale: " + String(c.error || "")
     return line
   }
 
   Timer { id: hoverArm; interval: 800; onTriggered: root.hoverArmed = true }
-  Timer { id: listDeadline; interval: 20000; onTriggered: if (listProc.running) { listProc.running = false; root.loading = false; root.error = "Timed out reading models." } }
+  Timer {
+    id: listDeadline
+    interval: 20000
+    onTriggered: if (listProc.running) {
+      // A killed run still delivers its partial output; `killed` keeps that
+      // from replacing this message or the models already shown.
+      listProc.killed = true
+      listProc.running = false
+      root.loading = false
+      root.error = "Timed out reading models from Ollama."
+    }
+  }
+
+  Timer { id: descDeadline; interval: 20000; onTriggered: if (descProc.running) descProc.running = false }
 
   Process {
     id: listProc
+    property bool killed: false
     onRunningChanged: running ? listDeadline.restart() : listDeadline.stop()
     onExited: root.loading = false
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (listProc.killed) return
         root.loading = false
-        if (text.length > 1048576) { root.models = []; root.error = "Helper output too large."; return }
+        if (text.length > 1048576) { root.error = "Helper output too large."; return }
+        var parsed
         try {
-          var parsed = JSON.parse(text)
-          root.models = Array.isArray(parsed.models) ? parsed.models.slice(0, 100) : []
-          root.error = parsed.ok === true ? "" : String(parsed.error || "Couldn't list models.")
+          parsed = JSON.parse(text)
         } catch (e) {
-          root.models = []
           root.error = "Couldn't read the helper's answer."
+          return
         }
+        root.models = Array.isArray(parsed.models) ? parsed.models.slice(0, 100) : []
+        root.error = parsed.ok === true ? "" : String(parsed.error || "Couldn't list models.")
         if (root.selectedIndex >= root.models.length) root.selectedIndex = Math.max(0, root.models.length - 1)
+        if (parsed.descriptionsDue === true && parsed.families && parsed.families.length > 0) {
+          var families = []
+          for (var i = 0; i < parsed.families.length; i++) families.push(String(parsed.families[i]))
+          root.fetchDescriptions(families)
+        }
+      }
+    }
+  }
+
+  Process {
+    id: descProc
+    onRunningChanged: running ? descDeadline.restart() : descDeadline.stop()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          if (Number(JSON.parse(text).changed) > 0 && root.opened) root.refresh()
+        } catch (e) {}
       }
     }
   }
@@ -143,7 +188,8 @@ Panel {
         if (dy !== 0 && root.models.length > 0)
           root.selectedIndex = Math.max(0, Math.min(root.models.length - 1, root.selectedIndex + dy))
       }
-      onReturnRequested: root.launchSelected()
+      // Return emits both returnRequested and activateRequested; Space only
+      // the latter. One handler, so Return can't launch twice.
       onActivateRequested: root.launchSelected()
       onTextKey: function(text) { if (text === "r") root.refresh() }
 
