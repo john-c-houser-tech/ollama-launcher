@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.john-c-houser-tech.ollama-launcher",
+  "name": "Ollama Launcher",
+  "version": "0.1.0",
+  "author": "John Houser",
+  "license": "MIT",
+  "description": "Your local Ollama models with a short description of each, opencode on any of them in one click, and the Ollama Cloud credit you have left.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Ollama Launcher",
+    "description": "Ollama Cloud credit in the bar; click for local models and launch opencode on one.",
+    "category": "AI",
+    "aliases": ["ollama", "opencode"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "projectDir": "~/Projects",
+      "creditRefreshMinutes": 15,
+      "showCredit": "On",
+      "fetchDescriptions": "On"
+    },
+    "schema": [
+      { "key": "projectDir", "type": "string", "label": "Folder opencode starts in", "defaultValue": "~/Projects" },
+      { "key": "creditRefreshMinutes", "type": "integer", "label": "Credit refresh (minutes)", "min": 5, "max": 120, "step": 5, "defaultValue": 15 },
+      { "key": "showCredit", "type": "enum", "label": "Show Ollama Cloud credit in the bar", "options": ["On", "Off"], "defaultValue": "On", "description": "Reads ollama.com/api/balance with the API key in ~/.config/omarchy/ollama-usage/api.key." },
+      { "key": "fetchDescriptions", "type": "enum", "label": "Model descriptions from ollama.com", "options": ["On", "Off"], "defaultValue": "On", "description": "Reads each model family's ollama.com library page at most once a week and caches it." }
+    ]
+  }
+}
