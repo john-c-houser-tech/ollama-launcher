@@ -11,6 +11,41 @@ Models that won't work well in opencode are listed last, with a warning:
 - **Small context.** A model with no `num_ctx` runs at Ollama's default (4,096 tokens on Ollama 0.40.7), which is too small for opencode's instructions and tool definitions; the start of a conversation can be cut off without warning. When another copy of the same weights has a larger context, the warning names it. A server-wide `OLLAMA_CONTEXT_LENGTH` in the `ollama` user unit (inline or in an `EnvironmentFile`) is taken into account.
 - **No tool support.** opencode can't read files, edit or run commands with the model.
 
+## Requirements
+
+- Omarchy with the Quattro shell. It provides `uwsm-app`, `xdg-terminal-exec` and the Nerd Font the bar uses.
+- Python 3.12 or newer. The helper uses the standard library only.
+- [Ollama](https://ollama.com) running locally on `127.0.0.1:11434`.
+- [opencode](https://opencode.ai) 2.x on your `PATH`, with an `ollama` provider pointing at the local Ollama.
+- For the credit only: an ollama.com API key in `~/.config/omarchy/ollama-usage/api.key` (the same file the Ollama Usage plugin reads). Without one, set `showCredit` to `Off`.
+
+## Install
+
+From Plugin Depot, or:
+
+```sh
+omarchy plugin add https://github.com/john-c-houser-tech/ollama-launcher.git --enable
+```
+
+To add the credit key yourself:
+
+```sh
+mkdir -p ~/.config/omarchy/ollama-usage
+install -m 600 /dev/null ~/.config/omarchy/ollama-usage/api.key
+$EDITOR ~/.config/omarchy/ollama-usage/api.key
+```
+
+The plugin writes nothing outside its cache folder: no opencode or Ollama configuration is changed.
+
+## Remove
+
+```sh
+omarchy plugin remove io.github.john-c-houser-tech.ollama-launcher
+rm -rf ~/.cache/omarchy/ollama-launcher
+```
+
+Leave `~/.config/omarchy/ollama-usage/api.key` in place if the Ollama Usage plugin still uses it.
+
 ## How the launch works
 
 opencode 2.x normally connects to a shared background service, which ignores per-launch configuration. The launcher runs `opencode --standalone` with `OPENCODE_CONFIG_CONTENT` set to the chosen model, for both the main model and the `title` agent, so nothing in the session goes to a cloud model and `opencode.json` is never written. The session still appears in `opencode session list`.
