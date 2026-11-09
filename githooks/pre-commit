@@ -24,7 +24,8 @@ fi
 # runs. git grep exits 0 on a match, 1 on none, and anything else on an error,
 # which must not pass as clean.
 status=0
-git grep --cached -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' || status=$?
+# UTF-8 even when the caller runs in the C locale, where -P rejects the pattern.
+LC_ALL=C.UTF-8 git grep --cached -lP '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' || status=$?
 case "$status" in
   0) echo "pre-commit: the staged files above contain bidi control characters" >&2; exit 1 ;;
   1) ;;
