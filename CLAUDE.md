@@ -70,7 +70,8 @@ integration branch.
 2. Branch from dev: `git checkout -b <feature>`. Check `git branch --show-current`
    before every commit.
 3. Commit there, push the branch, and open a PR into dev: `gh pr create --base dev`.
-4. Wait for `gh pr checks <n>` to pass. dev's ruleset doesn't require CI, but
+4. Wait for CI to pass: `gh pr checks <n> --watch` (without `--watch` it
+   returns at once while checks are still running). dev's ruleset doesn't require CI, but
    main's requires the `CI result` check, so a red PR merged into dev blocks
    the next merge to main.
 5. Before review requests, run independent agent reviews of the PR and fix
